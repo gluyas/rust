@@ -27,18 +27,17 @@ pub enum ProfileCategory {
     Other,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProfilerEvent {
-    QueryStart { query_name: &'static str, category: ProfileCategory, time: u64 },
-    QueryEnd { query_name: &'static str, category: ProfileCategory, time: u64 },
-    GenericActivityStart { category: ProfileCategory, label: Cow<'static, str>, time: u64 },
-    GenericActivityEnd { category: ProfileCategory, label: Cow<'static, str>, time: u64 },
-    IncrementalLoadResultStart { query_name: &'static str, time: u64 },
-    IncrementalLoadResultEnd { query_name: &'static str, time: u64 },
-    QueryCacheHit { query_name: &'static str, category: ProfileCategory, time: u64 },
-    QueryCount { query_name: &'static str, category: ProfileCategory, count: usize, time: u64 },
-    QueryBlockedStart { query_name: &'static str, category: ProfileCategory, time: u64 },
-    QueryBlockedEnd { query_name: &'static str, category: ProfileCategory, time: u64 },
+bitflags! {
+    struct EventFilter: u32 {
+        const GENERIC_ACTIVITIES = 0b00000001;
+        const QUERY_PROVIDERS    = 0b00000010;
+        const QUERY_CACHE_HITS   = 0b00000100;
+        const QUERY_BLOCKED      = 0b00001000;
+        const INCR_CACHE_LOADS   = 0b00010000;
+
+        const DEFAULT = Self::GENERIC_ACTIVITIES.bits |
+                        Self::QUERY_PROVIDERS.bits;
+    }
 }
 
 fn thread_id_to_u64(tid: ThreadId) -> u64 {
@@ -47,6 +46,7 @@ fn thread_id_to_u64(tid: ThreadId) -> u64 {
 
 pub struct SelfProfiler {
     profiler: Profiler,
+    event_filter_mask: EventFilter,
     query_event_kind: StringId,
     generic_activity_event_kind: StringId,
     incremental_load_result_event_kind: StringId,
@@ -55,7 +55,7 @@ pub struct SelfProfiler {
 }
 
 impl SelfProfiler {
-    pub fn new() -> Result<SelfProfiler, Box<dyn Error>> {
+    pub fn new(event_filters: &Option<Vec<String>>) -> Result<SelfProfiler, Box<dyn Error>> {
         let filename = format!("pid-{}.rustc_profile", process::id());
         let path = std::path::Path::new(&filename);
         let profiler = Profiler::new(path)?;
@@ -66,8 +66,31 @@ impl SelfProfiler {
         let query_blocked_event_kind = profiler.alloc_string("QueryBlocked");
         let query_cache_hit_event_kind = profiler.alloc_string("QueryCacheHit");
 
+        let mut event_filter_mask = EventFilter::empty();
+
+        if let &Some(ref event_filters) = event_filters {
+            for item in event_filters {
+                event_filter_mask |= match &item[..] {
+                    "none" => EventFilter::empty(),
+                    "all" => EventFilter::all(),
+                    "generic-activities" => EventFilter::GENERIC_ACTIVITIES,
+                    "queries" => EventFilter::QUERY_PROVIDERS,
+                    "query-cache-hits" => EventFilter::QUERY_CACHE_HITS,
+                    "query-blocked" => EventFilter::QUERY_BLOCKED,
+                    "incr-cache-loads" => EventFilter::INCR_CACHE_LOADS,
+                    other => {
+                        warn!("unknown self-profiler event filter: `{}`", other);
+                        EventFilter::empty()
+                    }
+                }
+            }
+        } else {
+            event_filter_mask = EventFilter::DEFAULT;
+        }
+
         Ok(SelfProfiler {
             profiler,
+            event_filter_mask,
             query_event_kind,
             generic_activity_event_kind,
             incremental_load_result_event_kind,
@@ -86,7 +109,6 @@ impl SelfProfiler {
 
     pub fn register_query_name(&self, query_name: QueryName) {
         let id = SelfProfiler::get_query_name_string_id(query_name);
-
         self.profiler.alloc_string_with_reserved_id(id, query_name.as_str());
     }
 
@@ -95,7 +117,9 @@ impl SelfProfiler {
         &self,
         label: impl Into<Cow<'static, str>>,
     ) {
-        self.record(&label.into(), self.generic_activity_event_kind, TimestampKind::Start);
+        if self.event_filter_mask.contains(EventFilter::GENERIC_ACTIVITIES) {
+            self.record(&label.into(), self.generic_activity_event_kind, TimestampKind::Start);
+        }
     }
 
     #[inline]
@@ -103,46 +127,62 @@ impl SelfProfiler {
         &self,
         label: impl Into<Cow<'static, str>>,
     ) {
-        self.record(&label.into(), self.generic_activity_event_kind, TimestampKind::End);
+        if self.event_filter_mask.contains(EventFilter::GENERIC_ACTIVITIES) {
+            self.record(&label.into(), self.generic_activity_event_kind, TimestampKind::End);
+        }
     }
 
     #[inline]
     pub fn record_query_hit(&self, query_name: QueryName) {
-        self.record_query(query_name, self.query_cache_hit_event_kind, TimestampKind::Instant);
+        if self.event_filter_mask.contains(EventFilter::QUERY_CACHE_HITS) {
+            self.record_query(query_name, self.query_cache_hit_event_kind, TimestampKind::Instant);
+        }
     }
 
     #[inline]
     pub fn start_query(&self, query_name: QueryName) {
-        self.record_query(query_name, self.query_event_kind, TimestampKind::Start);
+        if self.event_filter_mask.contains(EventFilter::QUERY_PROVIDERS) {
+            self.record_query(query_name, self.query_event_kind, TimestampKind::Start);
+        }
     }
 
     #[inline]
     pub fn end_query(&self, query_name: QueryName) {
-        self.record_query(query_name, self.query_event_kind, TimestampKind::End);
+        if self.event_filter_mask.contains(EventFilter::QUERY_PROVIDERS) {
+            self.record_query(query_name, self.query_event_kind, TimestampKind::End);
+        }
     }
 
     #[inline]
     pub fn incremental_load_result_start(&self, query_name: QueryName) {
-        self.record_query(
-            query_name,
-            self.incremental_load_result_event_kind,
-            TimestampKind::Start
-        );
+        if self.event_filter_mask.contains(EventFilter::INCR_CACHE_LOADS) {
+            self.record_query(
+                query_name,
+                self.incremental_load_result_event_kind,
+                TimestampKind::Start
+            );
+        }
     }
 
     #[inline]
     pub fn incremental_load_result_end(&self, query_name: QueryName) {
-        self.record_query(query_name, self.incremental_load_result_event_kind, TimestampKind::End);
+        if self.event_filter_mask.contains(EventFilter::INCR_CACHE_LOADS) {
+            self.record_query(query_name, self.incremental_load_result_event_kind, TimestampKind::End);
+        }
     }
 
     #[inline]
     pub fn query_blocked_start(&self, query_name: QueryName) {
-        self.record_query(query_name, self.query_blocked_event_kind, TimestampKind::Start);
+        if self.event_filter_mask.contains(EventFilter::QUERY_BLOCKED) {
+            self.record_query(query_name, self.query_blocked_event_kind, TimestampKind::Start);
+        }
     }
 
     #[inline]
     pub fn query_blocked_end(&self, query_name: QueryName) {
-        self.record_query(query_name, self.query_blocked_event_kind, TimestampKind::End);
+        if self.event_filter_mask.contains(EventFilter::QUERY_BLOCKED) {
+            self.record_query(query_name, self.query_blocked_event_kind, TimestampKind::End);
+        }
     }
 
     #[inline]
